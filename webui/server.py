@@ -7,6 +7,7 @@ import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -17,13 +18,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sdk.exportv2 import default_export_zip, run_export  # noqa: E402
+from webui.train_manager import list_export_datasets, train_manager  # noqa: E402
+from webui.train_page import TRAIN_PAGE_HTML  # noqa: E402
 
-app = FastAPI(title="mmplatform export", version="0.1.0")
+app = FastAPI(title="mmplatform webui", version="0.2.0")
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
 class ExportRequest(BaseModel):
     task_id: int = Field(..., ge=1, description="CVAT task id")
+
+
+class TrainStartRequest(BaseModel):
+    data_root_rel: str = Field(..., description="Relative path under repo root, e.g. data/exports/task_1_coco")
+    train_ann: str = Field(..., description="Annotation path relative to data_root")
+    val_ann: str = Field(..., description="Annotation path relative to data_root")
+    train_img_prefix: str = Field(..., description="Image prefix relative to data_root")
+    val_img_prefix: str = Field(..., description="Image prefix relative to data_root")
+    max_epochs: int = Field(50, ge=1, le=10000)
+    lr: float = Field(0.001, gt=0, le=100.0)
+    batch_size: int = Field(4, ge=1, le=256)
+    config_path: Optional[str] = Field(
+        default=None, description="Optional path to an mmdet config under third_party/mmdetection"
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -48,6 +65,7 @@ def index() -> str:
   </style>
 </head>
 <body>
+  <nav style="margin-bottom:1rem;font-size:0.95rem"><a href="/">CVAT export</a> &middot; <a href="/train">YOLOX 学習</a></nav>
   <h1>CVAT COCO export</h1>
   <p class="muted">ZIP は <code>data/exports/task_{task-id}_{YYYY_MMDD_HHMM}.zip</code> を自動で使います。</p>
   <form id="f">
@@ -134,6 +152,51 @@ async def api_export(body: ExportRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"{exc!s}\n{tb}") from exc
 
     return {"ok": True, "out_zip": out_zip_s, "extract_dir": extract_dir_s}
+
+
+@app.get("/train", response_class=HTMLResponse)
+def train_page() -> str:
+    return TRAIN_PAGE_HTML
+
+
+@app.get("/api/train/datasets")
+def api_train_datasets() -> dict:
+    return {"datasets": list_export_datasets()}
+
+
+@app.get("/api/train/state")
+def api_train_state() -> dict:
+    snap = train_manager.active_snapshot()
+    if snap is None:
+        return {"status": "idle", "lines_tail": [], "loss_points": []}
+    return snap
+
+
+@app.post("/api/train/start")
+def api_train_start(body: TrainStartRequest) -> dict:
+    try:
+        job = train_manager.start(
+            data_root_rel=body.data_root_rel,
+            train_ann=body.train_ann,
+            val_ann=body.val_ann,
+            train_img_prefix=body.train_img_prefix,
+            val_img_prefix=body.val_img_prefix,
+            max_epochs=body.max_epochs,
+            lr=body.lr,
+            batch_size=body.batch_size,
+            config_path=body.config_path,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "job_id": job.job_id, "work_dir": job.work_dir}
+
+
+@app.post("/api/train/stop")
+def api_train_stop() -> dict:
+    ok = train_manager.stop()
+    return {"ok": ok}
 
 
 def main() -> None:
