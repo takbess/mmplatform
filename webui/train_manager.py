@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -25,6 +26,9 @@ EPOCH_TRAIN_RE = re.compile(
     r"Epoch\(train\)\s+\[(\d+)\]\[\s*(\d+)/(\d+)\]"
 )
 LOSS_TOKEN_RE = re.compile(r"\bloss:\s+([\d.]+(?:e[+-]?\d+)?)", re.IGNORECASE)
+
+# チャート初期表示（フロントと揃える）
+DEFAULT_CHART_METRICS = ["loss", "memory", "coco/bbox_mAP"]
 
 
 def export_stamp() -> str:
@@ -91,6 +95,66 @@ def _parse_train_loss_line(line: str) -> Optional[Dict[str, Any]]:
     return {"epoch": epoch, "iter": it, "iter_total": total, "loss": loss}
 
 
+def _find_scalars_json(work_dir: Path) -> Optional[Path]:
+    """MMEngine が書く JSONL（1 行 1 メトリック記録）。"""
+    if not work_dir.is_dir():
+        return None
+    candidates = list(work_dir.glob("*/vis_data/scalars.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _metric_sort_key(name: str) -> tuple:
+    if name == "loss":
+        return (0, name)
+    if name.startswith("loss_"):
+        return (1, name)
+    if name == "memory":
+        return (2, name)
+    if name.startswith("coco/bbox_mAP"):
+        return (3, name)
+    return (9, name)
+
+
+def _parse_scalars_json(path: Path) -> tuple:
+    series: Dict[str, List[Dict[str, Any]]] = {}
+    keys_seen: set = set()
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}, []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        step = obj.get("step")
+        if step is None:
+            continue
+        try:
+            step_f = float(step)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(step_f):
+            continue
+        for k, v in obj.items():
+            if k == "step":
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            fv = float(v)
+            if not math.isfinite(fv):
+                continue
+            keys_seen.add(k)
+            series.setdefault(k, []).append({"step": step_f, "value": fv})
+    available = sorted(keys_seen, key=_metric_sort_key)
+    return series, available
+
+
 @dataclass
 class TrainJob:
     job_id: str
@@ -117,8 +181,17 @@ class TrainJob:
         with self._lock:
             lst = list(self.lines)
             lp = list(self.loss_points)
+            wd = self.work_dir
         if tail > 0 and len(lst) > tail:
             lst = lst[-tail:]
+        metric_series: Dict[str, List[Dict[str, Any]]] = {}
+        available_metrics: List[str] = []
+        scalars_path: Optional[str] = None
+        if wd:
+            sp = _find_scalars_json(Path(wd))
+            if sp is not None and sp.is_file():
+                metric_series, available_metrics = _parse_scalars_json(sp)
+                scalars_path = str(sp)
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -127,6 +200,10 @@ class TrainJob:
             "error": self.error,
             "lines_tail": lst,
             "loss_points": lp,
+            "metric_series": metric_series,
+            "available_metrics": available_metrics,
+            "scalars_path": scalars_path,
+            "default_metrics": list(DEFAULT_CHART_METRICS),
         }
 
 

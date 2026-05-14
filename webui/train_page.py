@@ -9,7 +9,7 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root { font-family: system-ui, sans-serif; }
-    body { max-width: 56rem; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.45; }
+    body { max-width: 58rem; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.45; }
     nav { margin-bottom: 1rem; font-size: 0.95rem; }
     nav a { margin-right: 1rem; }
     label { display: block; font-weight: 600; margin-top: 0.75rem; }
@@ -18,19 +18,20 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
     .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-top: 0.5rem; }
     .row > div { flex: 1 1 12rem; }
     button { margin-top: 1rem; margin-right: 0.5rem; padding: 0.45rem 0.9rem; font-size: 1rem; cursor: pointer; }
-    #log { width: 100%; height: 14rem; font-family: ui-monospace, monospace; font-size: 0.78rem; overflow: auto; background: #111; color: #e8e8e8; padding: 0.5rem; border-radius: 4px; white-space: pre-wrap; }
-    #chartWrap { margin-top: 1rem; max-width: 100%; height: 280px; }
+    #log { width: 100%; height: 12rem; font-family: ui-monospace, monospace; font-size: 0.78rem; overflow: auto; background: #111; color: #e8e8e8; padding: 0.5rem; border-radius: 4px; white-space: pre-wrap; }
+    .chart-panel { margin-top: 1rem; max-width: 100%; height: 240px; position: relative; }
     .muted { color: #555; font-size: 0.88rem; }
     .err { color: #a22; }
     .ok { color: #080; }
     .status { margin-top: 0.5rem; font-weight: 600; }
+    #metricChecks { margin-top: 0.5rem; padding: 0.5rem 0; border: 1px solid #ddd; border-radius: 4px; max-height: 10rem; overflow: auto; }
+    #metricChecks label { display: inline-block; margin: 0 0.75rem 0.35rem 0; font-weight: 400; font-size: 0.88rem; }
   </style>
 </head>
 <body>
   <nav><a href="/">CVAT export</a><a href="/train">YOLOX 学習</a></nav>
   <h1>YOLOX-S ファインチューン</h1>
-  <p class="muted">data/exports 配下の COCO 展開ディレクトリを選び、<code>yolox_s_finetune.py</code> 相当の設定で
-    <code>python -m webui.mmdet_train_worker</code> を起動します（ログは下記にストリーム表示）。</p>
+  <p class="muted">メトリックは <code>work_dirs/.../vis_data/scalars.json</code> から読み取ります（学習開始後しばらくでファイルが現れます）。</p>
 
   <label for="dataset">データセット（data/exports）</label>
   <select id="dataset"></select>
@@ -68,16 +69,30 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
   </div>
   <div id="status" class="status"></div>
   <div id="workdir" class="muted"></div>
+  <div id="scalarpath" class="muted"></div>
 
-  <h2>loss（train）</h2>
-  <div id="chartWrap"><canvas id="lossChart"></canvas></div>
+  <h2>メトリック（折れ線）</h2>
+  <p class="muted">初期表示: <strong>loss</strong> / <strong>memory</strong> / <strong>coco/bbox_mAP</strong> のみ。下のチェックで loss_* ・ memory ・ lr ・ time ・ coco/bbox_mAP_* などを追加できます。</p>
+  <div id="metricChecks"></div>
+
+  <h3>loss 系（loss, loss_cls, …）</h3>
+  <div class="chart-panel"><canvas id="cLoss"></canvas></div>
+  <h3>COCO bbox mAP（validation）</h3>
+  <div class="chart-panel"><canvas id="cMap"></canvas></div>
+  <h3>memory / lr / time など</h3>
+  <div class="chart-panel"><canvas id="cSys"></canvas></div>
 
   <h2>ログ</h2>
   <div id="log"></div>
 
   <script>
+    const STORAGE_KEY = 'mmplatform_train_selected_metrics';
     let datasets = [];
-    let chart = null;
+    let lastState = {};
+    let defaultMetrics = ['loss', 'memory', 'coco/bbox_mAP'];
+    const chartRefs = { loss: null, map: null, sys: null };
+    let prevAvailKey = '';
+    let prevWorkDirForCharts = undefined;
 
     function fillSelect(el, options, getv) {
       el.innerHTML = '';
@@ -118,39 +133,162 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
       onDatasetChange();
     }
 
-    function ensureChart() {
-      const ctx = document.getElementById('lossChart').getContext('2d');
-      if (chart) { chart.destroy(); chart = null; }
-      chart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: [], datasets: [{ label: 'loss', data: [], borderColor: '#36a', tension: 0.1, pointRadius: 0 }] },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          scales: { x: { title: { display: true, text: 'step' } }, y: { title: { display: true, text: 'loss' } } }
-        }
-      });
+    function chartBucket(key) {
+      if (key === 'loss' || key.startsWith('loss_')) return 'loss';
+      if (key.indexOf('bbox_mAP') !== -1 || key.indexOf('coco/bbox') === 0) return 'map';
+      return 'sys';
     }
 
-    function updateChart(points) {
-      if (!chart) ensureChart();
-      chart.data.labels = points.map(p => p.step);
-      chart.data.datasets[0].data = points.map(p => p.loss);
-      chart.update('none');
+    function buildChartPayload(metricSeries, selectedKeys, bucket) {
+      const steps = new Set();
+      for (const k of selectedKeys) {
+        if (chartBucket(k) !== bucket) continue;
+        (metricSeries[k] || []).forEach(p => steps.add(p.step));
+      }
+      const labels = Array.from(steps).sort((a, b) => a - b);
+      const palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf'];
+      const datasetsOut = [];
+      let ci = 0;
+      for (const k of selectedKeys) {
+        if (chartBucket(k) !== bucket) continue;
+        const pts = metricSeries[k] || [];
+        const byStep = {};
+        pts.forEach(p => { byStep[String(p.step)] = p.value; });
+        const data = labels.map(s => (Object.prototype.hasOwnProperty.call(byStep, String(s)) ? byStep[String(s)] : null));
+        datasetsOut.push({
+          label: k,
+          data: data,
+          borderColor: palette[ci++ % palette.length],
+          backgroundColor: 'transparent',
+          tension: 0.12,
+          pointRadius: 0,
+          spanGaps: false
+        });
+      }
+      return { labels, datasets: datasetsOut };
+    }
+
+    function chartOptions(yTitle, showLegend) {
+      return {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { display: showLegend, position: 'bottom' } },
+        scales: {
+          x: { title: { display: true, text: 'step' } },
+          y: { title: { display: true, text: yTitle } }
+        }
+      };
+    }
+
+    function renderOneChart(refKey, canvasId, metricSeries, selectedKeys, yTitle) {
+      const el = document.getElementById(canvasId);
+      if (!el) return;
+      const { labels, datasets } = buildChartPayload(metricSeries, selectedKeys, refKey);
+      const ctx = el.getContext('2d');
+      const ch = chartRefs[refKey];
+      if (!ch) {
+        chartRefs[refKey] = new Chart(ctx, {
+          type: 'line',
+          data: { labels, datasets },
+          options: chartOptions(yTitle, datasets.length > 0)
+        });
+        return;
+      }
+      ch.data.labels = labels;
+      ch.data.datasets = datasets;
+      ch.options.plugins.legend.display = datasets.length > 0;
+      if (ch.options.scales && ch.options.scales.y && ch.options.scales.y.title) {
+        ch.options.scales.y.title.text = yTitle;
+      }
+      ch.update('none');
+    }
+
+    function getSelectedMetrics() {
+      const box = document.getElementById('metricChecks');
+      if (!box) return [];
+      return [...box.querySelectorAll('input[type=checkbox]:checked')].map(i => i.dataset.metric);
+    }
+
+    function destroyChart(refKey) {
+      if (chartRefs[refKey]) {
+        chartRefs[refKey].destroy();
+        chartRefs[refKey] = null;
+      }
+    }
+
+    function renderChartsFromState(j) {
+      const wd = j.work_dir != null ? j.work_dir : null;
+      if (wd !== prevWorkDirForCharts) {
+        prevWorkDirForCharts = wd;
+        ['loss', 'map', 'sys'].forEach(destroyChart);
+      }
+      const ms = j.metric_series || {};
+      const sel = getSelectedMetrics();
+      const yLoss = 'loss 系';
+      const yMap = 'mAP';
+      const ySys = 'memory / lr / time …';
+      renderOneChart('loss', 'cLoss', ms, sel, yLoss);
+      renderOneChart('map', 'cMap', ms, sel, yMap);
+      renderOneChart('sys', 'cSys', ms, sel, ySys);
+    }
+
+    function rebuildCheckboxes(available) {
+      const box = document.getElementById('metricChecks');
+      if (!available || !available.length) {
+        box.innerHTML = '<span class="muted">（scalars 未生成）</span>';
+        return;
+      }
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch (e) {}
+      const fromSaved = Array.isArray(saved) ? saved.filter(m => available.includes(m)) : [];
+      let selected = new Set(fromSaved);
+      if (selected.size === 0) {
+        defaultMetrics.forEach(m => { if (available.includes(m)) selected.add(m); });
+      }
+      box.innerHTML = '';
+      for (const m of available) {
+        const safeId = 'mc_' + m.replace(/[^a-zA-Z0-9]+/g, '_');
+        const lab = document.createElement('label');
+        const inp = document.createElement('input');
+        inp.type = 'checkbox';
+        inp.dataset.metric = m;
+        inp.id = safeId;
+        inp.checked = selected.has(m);
+        inp.addEventListener('change', () => {
+          const all = [...box.querySelectorAll('input[type=checkbox]:checked')].map(i => i.dataset.metric);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+          renderChartsFromState(lastState);
+        });
+        lab.appendChild(inp);
+        lab.appendChild(document.createTextNode(' ' + m));
+        box.appendChild(lab);
+      }
     }
 
     async function poll() {
       const r = await fetch('/api/train/state');
       const j = await r.json();
+      lastState = j;
+      if (Array.isArray(j.default_metrics) && j.default_metrics.length) defaultMetrics = j.default_metrics;
       const st = j.status || 'idle';
       document.getElementById('status').textContent = '状態: ' + st;
       document.getElementById('status').className = 'status ' + (st === 'failed' ? 'err' : (st === 'completed' ? 'ok' : ''));
       document.getElementById('workdir').textContent = j.work_dir ? ('work_dir: ' + j.work_dir) : '';
+      document.getElementById('scalarpath').textContent = j.scalars_path ? ('scalars: ' + j.scalars_path) : '';
       if (j.error) document.getElementById('status').textContent += ' — ' + j.error;
       document.getElementById('log').textContent = (j.lines_tail || []).join('\\n');
       const logEl = document.getElementById('log');
       logEl.scrollTop = logEl.scrollHeight;
-      if (j.loss_points && j.loss_points.length) updateChart(j.loss_points);
+
+      const avail = j.available_metrics || [];
+      const key = avail.join('|');
+      if (key !== prevAvailKey) {
+        prevAvailKey = key;
+        rebuildCheckboxes(avail);
+      }
+      renderChartsFromState(j);
     }
 
     document.getElementById('dataset').addEventListener('change', onDatasetChange);
@@ -159,7 +297,6 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
       const ds = document.getElementById('dataset').value;
       if (!ds) { alert('データセットを選択してください'); return; }
       const d = datasets.find(x => x.id === ds);
-      ensureChart();
       const body = {
         data_root_rel: d.data_root_rel,
         train_ann: document.getElementById('train_ann').value,
@@ -176,6 +313,7 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
         alert(typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail));
         return;
       }
+      prevAvailKey = '';
       poll();
     });
 
@@ -184,7 +322,7 @@ TRAIN_PAGE_HTML = """<!DOCTYPE html>
       poll();
     });
 
-    loadDatasets().then(() => { ensureChart(); poll(); setInterval(poll, 1200); });
+    loadDatasets().then(() => { poll(); setInterval(poll, 1200); });
   </script>
 </body>
 </html>

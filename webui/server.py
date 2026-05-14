@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sdk.exportv2 import default_export_zip, run_export  # noqa: E402
-from webui.train_manager import list_export_datasets, train_manager  # noqa: E402
+from webui.train_manager import DEFAULT_CHART_METRICS, list_export_datasets, train_manager  # noqa: E402
 from webui.train_page import TRAIN_PAGE_HTML  # noqa: E402
 
 app = FastAPI(title="mmplatform webui", version="0.2.0")
@@ -168,7 +168,15 @@ def api_train_datasets() -> dict:
 def api_train_state() -> dict:
     snap = train_manager.active_snapshot()
     if snap is None:
-        return {"status": "idle", "lines_tail": [], "loss_points": []}
+        return {
+            "status": "idle",
+            "lines_tail": [],
+            "loss_points": [],
+            "metric_series": {},
+            "available_metrics": [],
+            "default_metrics": list(DEFAULT_CHART_METRICS),
+            "scalars_path": None,
+        }
     return snap
 
 
