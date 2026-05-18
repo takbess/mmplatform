@@ -10,6 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from webui.work_dir_summary import summarize_work_dir
+
 ROOT = Path(__file__).resolve().parent.parent
 WORK_DIR_PARENT = ROOT / "work_dirs"
 MMDET_ROOT = (ROOT / "third_party" / "mmdetection").resolve()
@@ -373,14 +375,19 @@ def list_deployable_work_dirs() -> List[Dict[str, Any]]:
             ckpt, ck_base = _resolve_checkpoint_path(p)
         except ValueError:
             continue
-        rows.append(
-            {
-                "id": p.name,
-                "checkpoint": ck_base,
-                "checkpoint_path": str(ckpt),
-                "nuclio_function": nuclio_function_id(p.name),
-            }
-        )
+        try:
+            cfg = find_training_config(p)
+            classes = infer_classes_from_config_py(cfg)
+        except ValueError:
+            classes = None
+        row: Dict[str, Any] = {
+            "id": p.name,
+            "checkpoint": ck_base,
+            "checkpoint_path": str(ckpt),
+            "nuclio_function": nuclio_function_id(p.name),
+        }
+        row["summary"] = summarize_work_dir(p, classes=classes)
+        rows.append(row)
     return rows
 
 

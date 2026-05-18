@@ -8,7 +8,7 @@ import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -22,7 +22,17 @@ from sdk.exportv2 import default_export_zip, run_export  # noqa: E402
 from webui.hub_page import hub_page_html  # noqa: E402
 from webui.nuclio_deploy import deploy_work_dir, list_deployable_work_dirs  # noqa: E402
 from webui.nuclio_deploy_page import NUCLIO_DEPLOY_PAGE_HTML  # noqa: E402
-from webui.train_manager import DEFAULT_CHART_METRICS, list_export_datasets, train_manager  # noqa: E402
+from webui.train_manager import (  # noqa: E402
+    DEFAULT_CHART_METRICS,
+    WEB_TRAIN_PREFIX,
+    default_work_dir_basename,
+    DEFAULT_CONFIG_REL,
+    list_export_datasets,
+    list_mmdet_configs,
+    list_pretrained_work_dirs,
+    suggest_categories_for_request,
+    train_manager,
+)
 from webui.train_page import TRAIN_PAGE_HTML  # noqa: E402
 
 app = FastAPI(title="mmplatform webui", version="0.3.1")
@@ -37,18 +47,42 @@ class NuclioDeployRequest(BaseModel):
     work_dir: str = Field(..., description="work_dirs 直下のフォルダ名（例: web_train_2026_0515_0016_0b4e73df）")
 
 
+class TrainDataSourceItem(BaseModel):
+    data_root_rel: str = Field(..., description="data/exports 配下の相対パス")
+    ann_file: str = Field(..., description="data_root からの相対パス（例: annotations/instances_Train.json）")
+    img_prefix: str = Field(..., description="画像プレフィックス（例: images/Train/）")
+
+
 class TrainStartRequest(BaseModel):
-    data_root_rel: str = Field(..., description="Relative path under repo root, e.g. data/exports/task_1_coco")
-    train_ann: str = Field(..., description="Annotation path relative to data_root")
-    val_ann: str = Field(..., description="Annotation path relative to data_root")
-    train_img_prefix: str = Field(..., description="Image prefix relative to data_root")
-    val_img_prefix: str = Field(..., description="Image prefix relative to data_root")
+    train_sources: List[TrainDataSourceItem] = Field(
+        ..., min_length=1, description="学習データ（複数可・別エクスポート可）"
+    )
+    val_sources: List[TrainDataSourceItem] = Field(
+        ..., min_length=1, description="検証データ（複数可・別エクスポート可）"
+    )
     max_epochs: int = Field(50, ge=1, le=10000)
     lr: float = Field(0.001, gt=0, le=100.0)
     batch_size: int = Field(4, ge=1, le=256)
     config_path: Optional[str] = Field(
         default=None, description="Optional path to an mmdet config under third_party/mmdetection"
     )
+    pretrained_work_dir: Optional[str] = Field(
+        default=None,
+        description="work_dirs 直下のフォルダ名。指定時は last_checkpoint の重みを事前学習として使う",
+    )
+    work_dir_name: Optional[str] = Field(
+        default=None,
+        description="web_train_ 以降の接尾辞、または web_train_* 全体。未指定時は自動生成",
+    )
+    classes: Optional[List[str]] = Field(
+        default=None,
+        description="学習するカテゴリ名。未指定時は train/val データから検出した全カテゴリ",
+    )
+
+
+class SuggestCategoriesRequest(BaseModel):
+    train_sources: List[TrainDataSourceItem] = Field(default_factory=list)
+    val_sources: List[TrainDataSourceItem] = Field(default_factory=list)
 
 
 @app.get("/hub", response_class=HTMLResponse)
@@ -205,6 +239,40 @@ def api_train_datasets() -> dict:
     return {"datasets": list_export_datasets()}
 
 
+@app.get("/api/train/configs")
+def api_train_configs() -> dict:
+    return {
+        "configs": list_mmdet_configs(),
+        "default_config": DEFAULT_CONFIG_REL,
+    }
+
+
+@app.get("/api/train/pretrained-models")
+def api_train_pretrained_models() -> dict:
+    return {"pretrained_models": list_pretrained_work_dirs()}
+
+
+@app.get("/api/train/default-work-dir")
+def api_train_default_work_dir() -> dict:
+    full = default_work_dir_basename()
+    return {
+        "work_dir_name": full,
+        "work_dir_prefix": WEB_TRAIN_PREFIX,
+        "work_dir_suffix_example": full[len(WEB_TRAIN_PREFIX) :],
+    }
+
+
+@app.post("/api/train/suggest-categories")
+def api_train_suggest_categories(body: SuggestCategoriesRequest) -> dict:
+    try:
+        return suggest_categories_for_request(
+            train_sources=[s.model_dump() for s in body.train_sources],
+            val_sources=[s.model_dump() for s in body.val_sources],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/train/state")
 def api_train_state() -> dict:
     snap = train_manager.active_snapshot()
@@ -225,15 +293,15 @@ def api_train_state() -> dict:
 def api_train_start(body: TrainStartRequest) -> dict:
     try:
         job = train_manager.start(
-            data_root_rel=body.data_root_rel,
-            train_ann=body.train_ann,
-            val_ann=body.val_ann,
-            train_img_prefix=body.train_img_prefix,
-            val_img_prefix=body.val_img_prefix,
+            train_sources=[s.model_dump() for s in body.train_sources],
+            val_sources=[s.model_dump() for s in body.val_sources],
             max_epochs=body.max_epochs,
             lr=body.lr,
             batch_size=body.batch_size,
             config_path=body.config_path,
+            pretrained_work_dir=body.pretrained_work_dir,
+            work_dir_name=body.work_dir_name,
+            classes=body.classes,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

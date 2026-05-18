@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 def _repo_root() -> Path:
@@ -26,53 +28,117 @@ def _ensure_paths() -> None:
     os.chdir(str(mmdet))
 
 
-def _apply_spec(cfg, spec: dict) -> None:
-    from pathlib import Path as P
+def _legacy_sources(spec: dict, split: str) -> List[Dict[str, str]]:
+    """Backward compat: single data_root + ann + prefix fields."""
+    dr = spec.get("data_root")
+    if split == "train":
+        ann, prefix = spec.get("train_ann"), spec.get("train_img_prefix")
+    else:
+        ann, prefix = spec.get("val_ann"), spec.get("val_img_prefix")
+    if not dr or not ann or not prefix:
+        return []
+    return [{"data_root": dr, "ann_file": ann, "img_prefix": prefix}]
 
-    data_root = P(spec["data_root"]).resolve()
-    dr = str(data_root)
-    train_ann = spec["train_ann"]
-    val_ann = spec["val_ann"]
-    train_img_prefix = spec["train_img_prefix"]
-    val_img_prefix = spec["val_img_prefix"]
-    max_epochs = int(spec["max_epochs"])
-    lr = float(spec["lr"])
-    batch_size = int(spec["batch_size"])
-    work_dir = spec["work_dir"]
 
-    cfg.train_dataloader.batch_size = batch_size
-    cfg.val_dataloader.batch_size = batch_size
+def _sources_from_spec(spec: dict, split: str) -> List[Dict[str, str]]:
+    key = f"{split}_sources"
+    rows = spec.get(key)
+    if isinstance(rows, list) and rows:
+        return rows
+    return _legacy_sources(spec, split)
 
-    cfg.train_dataloader.dataset.dataset.data_root = dr
-    cfg.train_dataloader.dataset.dataset.ann_file = train_ann
-    cfg.train_dataloader.dataset.dataset.data_prefix["img"] = train_img_prefix
 
-    cfg.val_dataloader.dataset.data_root = dr
-    cfg.val_dataloader.dataset.ann_file = val_ann
-    cfg.val_dataloader.dataset.data_prefix["img"] = val_img_prefix
+def _coco_subdataset(
+    template: dict,
+    source: Dict[str, str],
+    classes: Optional[List[str]] = None,
+) -> dict:
+    ds = copy.deepcopy(template)
+    ds["data_root"] = source["data_root"]
+    ds["ann_file"] = source["ann_file"]
+    ds["data_prefix"] = dict(img=source["img_prefix"])
+    if classes:
+        ds["metainfo"] = dict(classes=tuple(classes))
+    return ds
 
-    if cfg.get("test_dataloader") is not None:
-        cfg.test_dataloader.dataset.data_root = dr
-        cfg.test_dataloader.dataset.ann_file = val_ann
-        cfg.test_dataloader.dataset.data_prefix["img"] = val_img_prefix
 
-    ann_val_abs = str(data_root / val_ann)
-    cfg.val_evaluator.ann_file = ann_val_abs
-    cfg.test_evaluator.ann_file = ann_val_abs
+def _build_dataset_cfg(
+    template: dict,
+    sources: List[Dict[str, str]],
+    classes: Optional[List[str]] = None,
+) -> dict:
+    if len(sources) == 1:
+        return _coco_subdataset(template, sources[0], classes)
+    return {
+        "type": "ConcatDataset",
+        "datasets": [_coco_subdataset(template, s, classes) for s in sources],
+    }
 
-    cfg.train_cfg.max_epochs = max_epochs
-    cfg.optim_wrapper.optimizer.lr = lr
 
+def _extract_coco_template(dataset_cfg: Any) -> dict:
+    """CocoDataset 相当の dict をテンプレートとして取り出す。"""
+    if not isinstance(dataset_cfg, dict):
+        raise ValueError("dataset 設定が dict ではありません。")
+    ds_type = dataset_cfg.get("type")
+    if ds_type == "MultiImageMixDataset":
+        return _extract_coco_template(dataset_cfg.get("dataset", {}))
+    if ds_type == "ConcatDataset":
+        subs = dataset_cfg.get("datasets") or []
+        if not subs:
+            raise ValueError("ConcatDataset に datasets がありません。")
+        return _extract_coco_template(subs[0])
+    if "ann_file" in dataset_cfg:
+        return copy.deepcopy(dataset_cfg)
+    raise ValueError(
+        f"データセット上書き未対応の type です: {ds_type!r}。"
+        " CocoDataset 系 config を選ぶか、yolox_s_finetune.py を使用してください。"
+    )
+
+
+def _apply_model_classes(cfg, classes: List[str]) -> None:
+    n = len(classes)
+    bbox_head = cfg.model.get("bbox_head")
+    if bbox_head is not None:
+        bbox_head.num_classes = n
+
+
+def _set_train_dataset(
+    cfg, sources: List[Dict[str, str]], classes: Optional[List[str]] = None
+) -> None:
+    train_ds = cfg.train_dataloader.dataset
+    template = _extract_coco_template(train_ds)
+    built = _build_dataset_cfg(template, sources, classes)
+    if _dataset_type(train_ds) == "MultiImageMixDataset":
+        train_ds.dataset = built
+    else:
+        cfg.train_dataloader.dataset = built
+
+
+def _dataset_type(dataset_cfg: Any) -> Optional[str]:
+    if isinstance(dataset_cfg, dict):
+        return dataset_cfg.get("type")
+    return getattr(dataset_cfg, "type", None)
+
+
+def _set_eval_dataset(
+    cfg, attr: str, sources: List[Dict[str, str]], classes: Optional[List[str]] = None
+) -> None:
+    loader = cfg.get(attr)
+    if loader is None:
+        return
+    template = _extract_coco_template(loader.dataset)
+    loader.dataset = _build_dataset_cfg(template, sources, classes)
+
+
+def _apply_yolox_param_scheduler(cfg, max_epochs: int, lr: float) -> None:
     sched = cfg.param_scheduler
-    if len(sched) < 3:
-        raise ValueError("config param_scheduler が想定と異なります（要素が3未満）。")
-
+    if not sched or len(sched) < 3:
+        return
     nel = int(cfg.get("num_last_epochs", 5))
     nel = max(1, min(nel, max_epochs - 1))
     cos_end = max_epochs - nel
     warm_end = min(5, max(1, cos_end - 1))
     cos_begin = 5 if cos_end > 6 else max(1, cos_end - 1)
-
     sched[0]["end"] = warm_end
     sched[1]["begin"] = cos_begin
     sched[1]["end"] = cos_end
@@ -81,11 +147,65 @@ def _apply_spec(cfg, spec: dict) -> None:
     sched[2]["begin"] = cos_end
     sched[2]["end"] = max_epochs
 
+
+def _apply_spec(cfg, spec: dict) -> None:
+    train_sources = _sources_from_spec(spec, "train")
+    val_sources = _sources_from_spec(spec, "val")
+    if not train_sources:
+        raise ValueError("train_sources が空です。")
+    if not val_sources:
+        raise ValueError("val_sources が空です。")
+
+    max_epochs = int(spec["max_epochs"])
+    lr = float(spec["lr"])
+    batch_size = int(spec["batch_size"])
+    work_dir = spec["work_dir"]
+    classes = spec.get("classes")
+    if classes is not None and not isinstance(classes, list):
+        raise ValueError("classes は文字列のリストである必要があります。")
+    class_list = list(classes) if classes else None
+
+    cfg.train_dataloader.batch_size = batch_size
+    cfg.val_dataloader.batch_size = batch_size
+
+    if class_list:
+        _apply_model_classes(cfg, class_list)
+
+    _set_train_dataset(cfg, train_sources, class_list)
+    _set_eval_dataset(cfg, "val_dataloader", val_sources, class_list)
+    _set_eval_dataset(cfg, "test_dataloader", val_sources, class_list)
+
+    ann_val_abs = spec.get("val_evaluator_ann_file")
+    if not ann_val_abs:
+        s0 = val_sources[0]
+        ann_val_abs = str(Path(s0["data_root"]) / s0["ann_file"])
+    if cfg.get("val_evaluator") is not None:
+        cfg.val_evaluator.ann_file = ann_val_abs
+    if cfg.get("test_evaluator") is not None:
+        cfg.test_evaluator.ann_file = ann_val_abs
+
+    if cfg.get("train_cfg") is not None:
+        cfg.train_cfg.max_epochs = max_epochs
+    if cfg.get("optim_wrapper") is not None and cfg.optim_wrapper.get("optimizer") is not None:
+        cfg.optim_wrapper.optimizer.lr = lr
+
+    _apply_yolox_param_scheduler(cfg, max_epochs, lr)
+
     asl = cfg.get("auto_scale_lr")
     if asl is not None:
         asl["base_batch_size"] = batch_size
 
     cfg.work_dir = work_dir
+
+    pretrained = spec.get("pretrained_checkpoint")
+    if pretrained:
+        init_cfg = cfg.model.get("init_cfg")
+        if init_cfg is None:
+            raise ValueError("pretrained_checkpoint を指定しましたが、config に model.init_cfg がありません。")
+        if isinstance(init_cfg, dict):
+            init_cfg["checkpoint"] = str(Path(pretrained).resolve())
+        else:
+            raise ValueError("model.init_cfg の形式が想定外です（dict を想定）。")
 
 
 def main() -> int:
